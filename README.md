@@ -2,7 +2,7 @@
 
 A demo notebook for the talk *Build an Open Multimodal Data Stack for Search, Curation, and Training* (Lei Xu). It is the live demo for slide 11, and the "Demo notebook" linked from the closing slide.
 
-[`multimodal-lakehouse-demo.ipynb`](multimodal-lakehouse-demo.ipynb) takes 3,000 COCO images through four steps on a single LanceDB table: raw image bytes, captions, metadata, CLIP embeddings and derived features all live in that table. Search, curation, feature engineering and training run on it directly, with no exports in between.
+[`multimodal-lakehouse-demo.ipynb`](multimodal-lakehouse-demo.ipynb) takes all 5,000 COCO val2017 images through four steps on a single LanceDB table: raw image bytes, captions, metadata, CLIP embeddings and derived features all live in that table. Search, curation, feature engineering and training run on it directly, with no exports in between.
 
 ## The four steps
 
@@ -25,17 +25,17 @@ jupyter lab multimodal-lakehouse-demo.ipynb
 
 The first run downloads about 525 MB of COCO data (Lance format, from [`lance-format/coco-captions-2017-lance`](https://huggingface.co/datasets/lance-format/coco-captions-2017-lance)) and about 600 MB of OpenCLIP ViT-B-32 weights. Both are cached, so later runs skip the downloads. No Hugging Face login is needed.
 
-Runtime: about 3 minutes on an Apple M-series laptop after the downloads. Most of the time goes to computing CLIP embeddings for 3,000 images. On a 2-vCPU Colab CPU runtime that step is several times slower; a GPU runtime is used automatically when one is available. Set `NUM_IMAGES` in section 1 to trade dataset size for time.
+Runtime: about 3 minutes on an Apple M-series laptop after the downloads. Most of the time goes to computing CLIP embeddings for 5,000 images. On a 2-vCPU Colab CPU runtime that step is several times slower; a GPU runtime is used automatically when one is available. Lower `NUM_IMAGES` in section 1 to trade dataset size for time.
 
 The notebook writes to `./data` (the LanceDB database, recreated on each run), `./.cache` (downloads) and `./checkpoints`.
 
 ## LanceDB Functions and Geneva
 
-The notebook calls its Python UDF columns (`brightness`, `dup_of`, `quality`) LanceDB Functions. Function columns run on LanceDB Cloud and Enterprise. To run on a laptop or in Colab, the notebook uses the [`geneva`](https://docs.lancedb.com/geneva) package, which has the same declare, attach, backfill pattern and runs it on a local Ray instance.
+The notebook calls its Python UDF columns (`brightness`, `dup_of`, `quality`) LanceDB Functions. Function columns run on LanceDB Enterprise. To run on a laptop or in Colab, the notebook uses the [`geneva`](https://docs.lancedb.com/geneva) package, which has the same declare, attach, backfill pattern and runs it on a local Ray instance.
 
 ## Notes for the slides
 
-The last cell of the notebook lists every place where the current API differs from the slide code, plus the calls that are local-only and their LanceDB Enterprise equivalents. In short:
+The notebook stands on its own and doesn't reference the slides. [`SLIDE_NOTES.md`](SLIDE_NOTES.md) lists every place where the current API differs from the slide code, plus the calls that are local-only and their LanceDB Enterprise equivalents. In short:
 
 - `LanceDataset(ds, batch_size=64, shuffle=True)`: there is no `shuffle` argument, and it is silently ignored. Use `sampler=ShardedBatchSampler(rank=0, world_size=1, randomize=True)`.
 - `DataLoader(LanceDataset(...))` needs `batch_size=None`, since `LanceDataset` already yields batches.

@@ -28,11 +28,11 @@ md(
     """
 # One table, from search to training
 
-This notebook takes 3,000 COCO images through four steps on a single LanceDB table: **search** for unlabeled night street scenes with pedestrians, **tag** the curated slice as a named version, **add a column** computed in place, and **train** a model on the tagged version. There are no exports between the steps.
+This notebook takes 5,000 COCO images through four steps on a single LanceDB table: **search** for unlabeled night street scenes with pedestrians, **tag** the curated slice as a named version, **add a column** computed in place, and **train** a model on the tagged version. There are no exports between the steps.
 
 Raw image bytes, captions, metadata, embeddings and derived features all live in the same table, so search, curation, feature engineering and training all run on it.
 
-It is the live demo for slide 11 of *Build an Open Multimodal Data Stack for Search, Curation, and Training* (Lei Xu). It runs on a laptop CPU or in free Colab, with no GPU needed. On an M-series laptop a full run takes about 3 minutes once the downloads are cached.
+It runs on a laptop CPU or in free Colab, with no GPU needed.
 
 | Step | Section | What happens to the table |
 |---|---|---|
@@ -132,7 +132,7 @@ print(db)
 
 md(
     """
-On LanceDB Enterprise the search, write and tag calls below stay the same; the notes at the end list the few local-only calls and their Enterprise equivalents.
+On LanceDB Enterprise the search, write and tag calls below stay the same.
 """
 )
 
@@ -242,13 +242,13 @@ md(
     """
 ## 1. Build the table
 
-We use 3,000 COCO val2017 images with their human-written captions. They come from a public Lance dataset on Hugging Face (about 525 MB, no login needed) and are cached in `./.cache`. We load 2,800 images now and keep 200 back to append later, as if they came from a new drive.
+We use all 5,000 COCO val2017 images with their human-written captions. They come from a public Lance dataset on Hugging Face (about 525 MB, no login needed) and are cached in `./.cache`. We load 4,800 images now and keep 200 back to append later, as if they came from a new drive.
 """
 )
 
 code(
     """
-NUM_IMAGES = 3_000     # up to 5,000; more images means a longer embedding step on CPU
+NUM_IMAGES = 5_000     # the whole val2017 split; lower it for a shorter embedding step on CPU
 
 coco_dir = snapshot_download(
     "lance-format/coco-captions-2017-lance",
@@ -344,8 +344,8 @@ def make_rows(source: pa.Table) -> list[dict]:
 
 tbl = db.create_table("images", schema=ImageRow, mode="overwrite")
 start = time.time()
-for offset in range(0, initial.num_rows, 700):        # four fragments of 700 rows
-    tbl.add(make_rows(initial.slice(offset, 700)))
+for offset in range(0, initial.num_rows, 1200):       # four fragments of 1,200 rows
+    tbl.add(make_rows(initial.slice(offset, 1200)))
 elapsed = time.time() - start
 print(f"Embedded and loaded {tbl.count_rows():,} rows in {elapsed:.0f}s ({tbl.count_rows() / elapsed:.0f} images/s on {DEVICE}), table version {tbl.version}")
 """
@@ -391,7 +391,7 @@ md(
     """
 ### Derive `brightness` with LanceDB Functions
 
-We need a `brightness` value to make "low-light" queryable. LanceDB Functions are LanceDB's Python UDF columns (formerly Geneva v2): you declare a function, attach it as a column, and LanceDB backfills it. Function columns run on LanceDB Cloud and Enterprise. **To run on a laptop or in Colab, this notebook uses the `geneva` package**, which has the same declare, attach, backfill pattern and runs it on the local Ray instance started above. The rest of the notebook calls these LanceDB Functions.
+We need a `brightness` value to make "low-light" queryable. LanceDB Functions are LanceDB's Python UDF columns: you declare a function, attach it as a column, and LanceDB backfills it. Function columns run on LanceDB Enterprise. **To run on a laptop or in Colab, this notebook uses the `geneva` package**, which has the same declare, attach, backfill pattern and runs it on the local Ray instance started above. The rest of the notebook calls these LanceDB Functions.
 """
 )
 
@@ -456,16 +456,16 @@ show_images(
 # --------------------------------------------------------------------------
 md(
     """
-## 2. Search (slide 7)
+## 2. Search
 
-We're looking for unlabeled night street scenes with pedestrians. One hybrid query combines CLIP vector search for "low-light street scene", BM25 full-text search for "pedestrian" over the captions, and a `label IS NULL` filter. The slide's one-line form runs as written:
+We're looking for unlabeled night street scenes with pedestrians. One hybrid query combines CLIP vector search for "low-light street scene", BM25 full-text search for "pedestrian" over the captions, and a `label IS NULL` filter. The shortest form passes a single string:
 """
 )
 
 code(
     """
-slide_form = tbl.search("low-light street scene", query_type="hybrid").where("label IS NULL").limit(500).to_pandas()
-print(f"{len(slide_form)} rows")
+one_string = tbl.search("low-light street scene", query_type="hybrid").where("label IS NULL").limit(500).to_pandas()
+print(f"{len(one_string)} rows")
 """
 )
 
@@ -537,7 +537,7 @@ md(
 # --------------------------------------------------------------------------
 md(
     """
-## 3. Curate and tag a slice (slide 8)
+## 3. Curate and tag a slice
 
 The search results above include burst copies (ids 10000 and up) next to their originals. We dedupe by embedding distance, keep the low-light rows, and freeze the result as a materialized view called `night_peds` with a tag. The dedupe is another LanceDB Function: for each row it runs a vector search on the same table and records the id of any earlier row that is almost identical.
 """
@@ -611,7 +611,7 @@ code(
 hit_ids = ",".join(map(str, results["id"]))
 tbl.add_columns({"in_night_peds": f"id IN ({hit_ids})"})
 
-view = db.create_materialized_view(       # local databases only; see the notes at the end
+view = db.create_materialized_view(       # local databases only
     "night_peds",
     "images",
     select=[
@@ -662,7 +662,7 @@ show_images(
 
 md(
     """
-Tag the version so it can be checked out by name. The slide's call runs as written, on the view's table:
+Tag the view's current version so it can be checked out by name:
 """
 )
 
@@ -750,7 +750,7 @@ version_timeline(night_peds, view_events(night_peds), "night-peds-v1", "night_pe
 # --------------------------------------------------------------------------
 md(
     """
-## 4. Add a column (slide 9)
+## 4. Add a column
 
 We add a `quality` score to every image, computed in place by a LanceDB Function that reads the image bytes. Before and after, we list the table's data files to check that no existing column was rewritten.
 """
@@ -866,7 +866,7 @@ md(
 # --------------------------------------------------------------------------
 md(
     """
-## 5. Train a step (slide 10)
+## 5. Train a step
 
 PyTorch reads the tagged version of `night_peds` directly from the table. We train a linear probe on `clip_emb` that predicts the weak `has_person` label, then save a checkpoint that records which table version it was trained on.
 """
@@ -1079,30 +1079,7 @@ md(
     """
 ## Running this in production
 
-The code above runs against a local folder. [LanceDB Enterprise](https://docs.lancedb.com/enterprise) runs the same tables as a distributed service in your cloud (BYOC) or as a managed deployment, with data in object storage. Start with the [architecture overview](https://docs.lancedb.com/enterprise/architecture), [Geneva feature engineering](https://docs.lancedb.com/geneva), or [contact the LanceDB team](https://www.lancedb.com/contact).
-"""
-)
-
-md(
-    """
-## Notes: local-only calls and slide differences
-
-The notebook uses the current Python APIs (lancedb 0.39, pylance 12, geneva 0.17). Where the slide code differs:
-
-| Slide | This notebook | Why |
-|---|---|---|
-| `lancedb.connect("./data")` | adds `read_consistency_interval=timedelta(0)` and `storage_options={"new_table_enable_stable_row_ids": "true"}` | Materialized views require stable row ids, set when the table is created. The interval makes the table handle see writes made by Geneva jobs. |
-| `tbl.search("low-light street scene", query_type="hybrid")` | runs as written; to search a different keyword, use `.vector("low-light street scene").text("pedestrian")` | A single string is used for both the vector and the full-text query. |
-| `tbl.tags.create("night-peds-v1", tbl.version)` | runs as written, on the view's table (`view.table`) | |
-| `LanceDataset(ds, batch_size=64, shuffle=True)` | `sampler=ShardedBatchSampler(rank=0, world_size=1, randomize=True)` | `LanceDataset` has no `shuffle` argument. Unknown keyword arguments are ignored, so `shuffle=True` silently does nothing. |
-| `DataLoader(LanceDataset(...))` | `DataLoader(LanceDataset(...), batch_size=None)` | `LanceDataset` already yields batches. With the default `batch_size=1`, PyTorch adds an extra leading dimension (1, 64, 512). |
-| image column as blob | plain `binary` column | Vector, full-text and hybrid queries can't return Blob API (`lance-encoding:blob`) columns. Plain binary comes back in search results. |
-
-Local-only pieces and their Enterprise equivalents:
-
-- **LanceDB Functions.** Function columns (`lancedb.udf`) run on LanceDB Cloud and Enterprise. Locally we use `geneva.udf`, `add_columns` and `backfill` with `local_ray_context()`. On Enterprise, connect Geneva with `geneva.connect("db://...", api_key=..., host_override=...)` and the same `backfill` call runs as a managed job.
-- **Materialized views.** `db.create_materialized_view(...)` in lancedb is local-only. Geneva provides `create_materialized_view` for Enterprise connections.
-- **Whole-table reads.** On Enterprise, `RemoteTable` has no `to_pandas()` or `to_arrow()`. Read through a query, for example `tbl.search().where(...).to_pandas()`, as most cells here already do.
+The code above runs against a local folder. [LanceDB Enterprise](https://docs.lancedb.com/enterprise) runs the same tables as a distributed service in your cloud (BYOC) or as a managed deployment, with data in object storage. Start with the [architecture overview](https://docs.lancedb.com/enterprise/architecture) or [contact the LanceDB team](https://www.lancedb.com/contact).
 """
 )
 
