@@ -6,10 +6,10 @@ A demo notebook for the talk *Build an Open Multimodal Data Stack for Search, Cu
 
 ## The four steps
 
-1. **Search.** One hybrid query finds unlabeled night street scenes with pedestrians: CLIP vector search for "low-light street scene", full-text search for "pedestrian" over the captions, and `label IS NULL`. The rows come back with their image bytes.
+1. **Search.** One hybrid query finds unlabeled night street scenes with pedestrians: CLIP vector search for "pedestrians crossing a dark street at night", full-text search for "pedestrian" over the captions, and the filter `label IS NULL AND brightness < 0.35 AND people_score > 0`. `brightness` is computed from the pixels and `people_score` from the CLIP embedding, both as LanceDB Functions. The rows come back with their image bytes.
 2. **Tag a slice.** Near-duplicates are flagged by embedding distance with a LanceDB Function. The low-light, deduplicated hits become a materialized view, `night_peds`, tagged `night-peds-v1`.
 3. **Add a column.** A `quality` score is computed in place from the image bytes. The data-file listing shows existing files are not rewritten, and appending rows computes only the new ones.
-4. **Train a step.** PyTorch reads `night-peds-v1` directly through `lance.torch.data.LanceDataset`. A linear probe trains on the CLIP embeddings, and its checkpoint records the table version. After more data arrives, checking out the tag reproduces the training data exactly.
+4. **Train a step.** PyTorch reads `night-peds-v1` directly through `lance.torch.data.LanceDataset`. A linear probe trains on the CLIP embeddings to predict whether a scene has a vehicle, and its checkpoint records the table version. After more data arrives, checking out the tag reproduces the training data exactly.
 
 ## Run it
 
@@ -31,16 +31,7 @@ The notebook writes to `./data` (the LanceDB database, recreated on each run), `
 
 ## LanceDB Functions and Geneva
 
-The notebook calls its Python UDF columns (`brightness`, `dup_of`, `quality`) LanceDB Functions. Function columns run on LanceDB Enterprise. To run on a laptop or in Colab, the notebook uses the [`geneva`](https://docs.lancedb.com/geneva) package, which has the same declare, attach, backfill pattern and runs it on a local Ray instance.
-
-## Notes for the slides
-
-The notebook stands on its own and doesn't reference the slides. [`SLIDE_NOTES.md`](SLIDE_NOTES.md) lists every place where the current API differs from the slide code, plus the calls that are local-only and their LanceDB Enterprise equivalents. In short:
-
-- `LanceDataset(ds, batch_size=64, shuffle=True)`: there is no `shuffle` argument, and it is silently ignored. Use `sampler=ShardedBatchSampler(rank=0, world_size=1, randomize=True)`.
-- `DataLoader(LanceDataset(...))` needs `batch_size=None`, since `LanceDataset` already yields batches.
-- `lancedb.connect("./data")` needs `storage_options={"new_table_enable_stable_row_ids": "true"}` for materialized views.
-- `tbl.search("low-light street scene", query_type="hybrid")` sends the same string to vector and full-text search. Use `.vector(...).text("pedestrian")` to search a different keyword.
+The notebook calls its Python UDF columns (`brightness`, `people_score`, `dup_of`, `quality`) LanceDB Functions. Function columns run on LanceDB Enterprise. To run on a laptop or in Colab, the notebook uses the [`geneva`](https://docs.lancedb.com/geneva) package, which has the same declare, attach, backfill pattern and runs it on a local Ray instance.
 
 ## Editing the notebook
 

@@ -172,7 +172,7 @@ def show_images(rows, title, ncols=4, subtitle=None, size=3.0):
     """Draw a grid of images straight from the `image` bytes column."""
     rows = list(rows)
     nrows = (len(rows) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * size, nrows * (size + 0.7)))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * size, nrows * (size + 1.1)))
     for ax in np.atleast_1d(axes).ravel():
         ax.axis("off")
     for ax, row in zip(np.atleast_1d(axes).ravel(), rows):
@@ -183,7 +183,7 @@ def show_images(rows, title, ncols=4, subtitle=None, size=3.0):
         caption = textwrap.fill(textwrap.shorten(row.get("caption", ""), 70, placeholder="..."), 34)
         ax.set_title(caption, fontsize=8, color=INK, loc="left", fontweight="normal")
         if subtitle:
-            ax.text(0, -0.02, subtitle(row), transform=ax.transAxes, fontsize=8, color=INK_2, va="top")
+            ax.text(0, -0.02, textwrap.fill(subtitle(row), 40), transform=ax.transAxes, fontsize=8, color=INK_2, va="top")
     fig.suptitle(title, x=0.01, ha="left", fontsize=12, fontweight="bold", color=INK)
     fig.tight_layout()
     buf = io.BytesIO()                                   # photos as JPEG keep the saved notebook small
@@ -317,10 +317,10 @@ def caption_mentions_person(captions):
     return re.search(PERSON_WORDS, " ".join(captions).lower()) is not None
 
 
-# Hold back 200 images for later: 40 street-at-night scenes plus 160 others, like a new night drive.
+# Hold back 200 images for later: 15 street-at-night scenes plus 185 others, like a new drive.
 night_rows = np.flatnonzero(caption_text.str.contains(STREET_AT_NIGHT).to_numpy())
 other_rows = np.setdiff1d(np.arange(coco.num_rows), night_rows)
-held_back_rows = np.sort(np.concatenate([rng.choice(night_rows, 40, replace=False), rng.choice(other_rows, 160, replace=False)]))
+held_back_rows = np.sort(np.concatenate([rng.choice(night_rows, 15, replace=False), rng.choice(other_rows, 185, replace=False)]))
 initial = coco.take(np.setdiff1d(np.arange(coco.num_rows), held_back_rows))
 held_back = coco.take(held_back_rows)          # appended in sections 4 and 6
 labeled_ids = set(rng.choice(initial["id"].to_numpy(), size=int(0.08 * initial.num_rows), replace=False).tolist())
@@ -389,9 +389,9 @@ print(f"Added {len(burst_rows)} burst copies; table now has {tbl.count_rows():,}
 
 md(
     """
-### Derive `brightness` with LanceDB Functions
+### Derive `brightness` and `people_score` with LanceDB Functions
 
-We need a `brightness` value to make "low-light" queryable. LanceDB Functions are LanceDB's Python UDF columns: you declare a function, attach it as a column, and LanceDB backfills it. Function columns run on LanceDB Enterprise. **To run on a laptop or in Colab, this notebook uses the `geneva` package**, which has the same declare, attach, backfill pattern and runs it on the local Ray instance started above. The rest of the notebook calls these LanceDB Functions.
+We need a `brightness` value to make "low-light" queryable, and a `people_score` so "with pedestrians" is queryable too. LanceDB Functions are LanceDB's Python UDF columns: you declare a function, attach it as a column, and LanceDB backfills it. Function columns run on LanceDB Enterprise. **To run on a laptop or in Colab, this notebook uses the `geneva` package**, which has the same declare, attach, backfill pattern and runs it on the local Ray instance started above. The rest of the notebook calls these LanceDB Functions.
 """
 )
 
@@ -425,6 +425,40 @@ print(f"Backfilled brightness for {tbl.count_rows('brightness IS NOT NULL'):,} r
 
 md(
     """
+`people_score` reuses the CLIP embedding already in each row, so it never decodes an image. It compares the embedding with text prompts for people and for scenes without people. A positive score means the image looks more like the people prompts.
+"""
+)
+
+code(
+    """
+PEOPLE = ["a photo of people", "a photo of a person walking"]
+NO_PEOPLE = ["a photo with no people in it", "an empty street"]
+
+
+@geneva.udf(data_type=pa.float32())
+class PeopleScore:
+    \"\"\"Best match to a people prompt minus best match to a no-people prompt (CLIP zero-shot).\"\"\"
+
+    def __init__(self, people: list, no_people: list):
+        self.people, self.no_people = np.array(people), np.array(no_people)
+
+    def __call__(self, clip_emb: np.ndarray) -> float:
+        return float((self.people @ clip_emb).max() - (self.no_people @ clip_emb).max())
+
+
+def embed_text(prompts):
+    return [clip.generate_text_embeddings(p).tolist() for p in prompts]
+
+
+fn_db.open_table("images").add_columns({"people_score": PeopleScore(embed_text(PEOPLE), embed_text(NO_PEOPLE))})
+start = time.time()
+backfill("people_score")
+print(f"Backfilled people_score in {time.time() - start:.1f}s: {tbl.count_rows('people_score > 0'):,} of {tbl.count_rows():,} images score above 0")
+"""
+)
+
+md(
+    """
 Last, a full-text index on the captions so the hybrid search in section 2 can match words like "pedestrian".
 """
 )
@@ -446,7 +480,7 @@ sample = pd.concat([
 show_images(
     sample.to_dict("records"),
     "Sample rows: image bytes, caption and label in one row",
-    subtitle=lambda r: f"id {r['id']}  |  label: {'null' if pd.isna(r['label']) else r['label']}  |  brightness {r['brightness']:.2f}",
+    subtitle=lambda r: f"id {r['id']}  |  label: {'null' if pd.isna(r['label']) else r['label']}  |  brightness {r['brightness']:.2f}  |  people {r['people_score']:+.3f}",
 )
 """
 )
@@ -458,13 +492,13 @@ md(
     """
 ## 2. Search
 
-We're looking for unlabeled night street scenes with pedestrians. One hybrid query combines CLIP vector search for "low-light street scene", BM25 full-text search for "pedestrian" over the captions, and a `label IS NULL` filter. The shortest form passes a single string:
+We're looking for unlabeled night street scenes with pedestrians. One hybrid query combines CLIP vector search for "pedestrians crossing a dark street at night", BM25 full-text search for "pedestrian" over the captions, and a filter on the columns derived in section 1: `label IS NULL` keeps unlabeled rows, `brightness < 0.35` keeps low-light images, and `people_score > 0` keeps images with people. The shortest form passes a single string:
 """
 )
 
 code(
     """
-one_string = tbl.search("low-light street scene", query_type="hybrid").where("label IS NULL").limit(500).to_pandas()
+one_string = tbl.search("pedestrians crossing a dark street at night", query_type="hybrid").where("label IS NULL AND brightness < 0.35 AND people_score > 0").limit(100).to_pandas()
 print(f"{len(one_string)} rows")
 """
 )
@@ -479,10 +513,10 @@ code(
     """
 results = (
     tbl.search(query_type="hybrid")
-    .vector("low-light street scene")    # CLIP text embedding, computed by the table
-    .text("pedestrian")                  # BM25 over the captions column
-    .where("label IS NULL")
-    .limit(500)
+    .vector("pedestrians crossing a dark street at night")   # CLIP text embedding, computed by the table
+    .text("pedestrian")                                      # BM25 over the captions column
+    .where("label IS NULL AND brightness < 0.35 AND people_score > 0")
+    .limit(100)
     .to_pandas()
 )
 
@@ -502,26 +536,28 @@ code(
     """
 show_images(
     results.head(12).to_dict("records"),
-    'Top 12 of the hybrid search: "low-light street scene" + "pedestrian", label IS NULL',
-    subtitle=lambda r: f"id {r['id']}  |  score {r['_relevance_score']:.3f}  |  brightness {r['brightness']:.2f}",
+    'Top 12 of the hybrid search, filtered to unlabeled, low-light images with people',
+    subtitle=lambda r: f"id {r['id']}  |  score {r['_relevance_score']:.3f}  |  brightness {r['brightness']:.2f}  |  people {r['people_score']:+.3f}",
 )
+"""
+)
+
+md(
+    """
+The filter narrows the candidates before scoring. Full-text search matches only the few images whose captions say "pedestrian", and vector search fills in the rest of the 100.
 """
 )
 
 code(
     """
-LOW_LIGHT = 0.35   # brightness threshold used for curation in section 3
-
-vector_ids = set(tbl.search("low-light street scene", query_type="vector").where("label IS NULL").limit(500).to_pandas()["id"])
-fts_ids = set(tbl.search("pedestrian", query_type="fts").where("label IS NULL").limit(500).to_pandas()["id"])
-unfiltered = tbl.search(query_type="hybrid").vector("low-light street scene").text("pedestrian").limit(500).to_pandas()
+fts_matches = tbl.search("pedestrian", query_type="fts").where("label IS NULL AND brightness < 0.35 AND people_score > 0").limit(1_000).to_pandas()
 
 barh(
-    ["Vector search, top 500", "Full-text matches for 'pedestrian'", "Matched by both",
-     "Labeled rows dropped by label IS NULL", "Hybrid result (RRF, limit 500)", f"...of which low-light (brightness < {LOW_LIGHT})"],
-    [len(vector_ids), len(fts_ids), len(vector_ids & fts_ids), int(unfiltered["label"].notna().sum()),
-     len(results), int((results["brightness"] < LOW_LIGHT).sum())],
-    "Where the hybrid result comes from",
+    ["All images", "label IS NULL", "...AND brightness < 0.35", "...AND people_score > 0",
+     "...full-text matches for 'pedestrian'", "Hybrid result (limit 100)"],
+    [tbl.count_rows(), tbl.count_rows("label IS NULL"), tbl.count_rows("label IS NULL AND brightness < 0.35"),
+     tbl.count_rows("label IS NULL AND brightness < 0.35 AND people_score > 0"), len(fts_matches), len(results)],
+    f"How the filter and the two searches narrow {tbl.count_rows():,} images to {len(results)}",
 )
 """
 )
@@ -539,7 +575,7 @@ md(
     """
 ## 3. Curate and tag a slice
 
-The search results above include burst copies (ids 10000 and up) next to their originals. We dedupe by embedding distance, keep the low-light rows, and freeze the result as a materialized view called `night_peds` with a tag. The dedupe is another LanceDB Function: for each row it runs a vector search on the same table and records the id of any earlier row that is almost identical.
+The search results above include burst copies (ids 10000 and up) next to their originals. We dedupe by embedding distance and freeze the result as a materialized view called `night_peds` with a tag. The dedupe is another LanceDB Function: for each row it runs a vector search on the same table and records the id of any earlier row that is almost identical.
 """
 )
 
@@ -602,12 +638,14 @@ show_images(pair_rows, "Near-duplicates found by embedding distance: two already
 
 md(
     """
-Record the search hits in the table as a boolean column. Adding a column from a SQL expression writes only that column. Then define the view: search hits that are low-light and not near-duplicates. The view also gets `has_person`, a weak label computed in SQL from the captions, which we train on in section 5.
+Record the search hits in the table as a boolean column. Adding a column from a SQL expression writes only that column. Then define the view: search hits that are not near-duplicates. The view also gets `has_vehicle`, a weak label computed in SQL from the captions (does any caption mention a car, bus, bike or other vehicle?), which we train on in section 5.
 """
 )
 
 code(
     """
+VEHICLE_WORDS = r"\\b(car|cars|bus|buses|truck|trucks|taxi|taxis|motorcycle|motorcycles|motorbike|scooter|bike|bikes|bicycle|bicycles|vehicle|vehicles|traffic|train|van|tram)\\b"
+
 hit_ids = ",".join(map(str, results["id"]))
 tbl.add_columns({"in_night_peds": f"id IN ({hit_ids})"})
 
@@ -616,9 +654,9 @@ view = db.create_materialized_view(       # local databases only
     "images",
     select=[
         "id", "image", "caption", "captions", "camera", "label", "clip_emb", "brightness",
-        ("has_person", f"regexp_like(lower(array_to_string(captions, ' ')), '{PERSON_WORDS}')"),
+        ("has_vehicle", f"regexp_like(lower(array_to_string(captions, ' ')), '{VEHICLE_WORDS}')"),
     ],
-    where=f"in_night_peds AND dup_of IS NULL AND brightness < {LOW_LIGHT}",
+    where="in_night_peds AND dup_of IS NULL",
 )
 refresh = view.refresh()
 night_peds = view.table
@@ -628,34 +666,19 @@ print(refresh)
 
 code(
     """
-hits = results.assign(is_dup=results["id"].isin(set(tbl.search().where("dup_of IS NOT NULL").select(["id"]).limit(10_000).to_pandas()["id"])))
-low_light_hits = hits[hits["brightness"] < LOW_LIGHT]
-
-groups = ["All search hits", f"Low-light hits (brightness < {LOW_LIGHT})"]
-before = [len(hits), len(low_light_hits)]
-after = [int((~hits["is_dup"]).sum()), night_peds.count_rows()]
-fig, ax = plt.subplots(figsize=(8, 2.6))
-y = np.arange(len(groups))[::-1]
-ax.barh(y + 0.19, before, height=0.36, color=BLUE, label="before dedupe")
-ax.barh(y - 0.19, after, height=0.36, color=ORANGE, label="after dedupe")
-for yi, b, a in zip(y, before, after):
-    ax.text(b, yi + 0.19, f"  {b}", va="center", fontsize=9, color=INK)
-    ax.text(a, yi - 0.19, f"  {a}", va="center", fontsize=9, color=INK)
-ax.set_yticks(y, groups)
-ax.grid(axis="y", visible=False)
-ax.set_xlim(0, max(before) * 1.12)
-ax.set_xlabel("rows")
-ax.legend(loc="lower right", frameon=False)
-ax.set_title(f"Before vs after dedupe: night_peds keeps {night_peds.count_rows()} rows")
-fig.tight_layout()
-plt.show()
+duplicate_hits = int(results["id"].isin(flagged["id"]).sum())
+barh(
+    ["Search hits (before dedupe)", "night_peds (after dedupe)"],
+    [len(results), night_peds.count_rows()],
+    f"Before vs after dedupe: {duplicate_hits} near-duplicates removed",
+)
 
 slice_rows = night_peds.search().limit(10_000).to_pandas()
 top_of_slice = results[["id", "_relevance_score"]].merge(slice_rows, on="id").head(8)   # keeps search rank order
 show_images(
     top_of_slice.to_dict("records"),
     "night_peds: the 8 highest-ranked rows of the slice",
-    subtitle=lambda r: f"id {r['id']}  |  brightness {r['brightness']:.2f}  |  has_person {r['has_person']}",
+    subtitle=lambda r: f"id {r['id']}  |  brightness {r['brightness']:.2f}  |  has_vehicle {r['has_vehicle']}",
 )
 """
 )
@@ -868,7 +891,7 @@ md(
     """
 ## 5. Train a step
 
-PyTorch reads the tagged version of `night_peds` directly from the table. We train a linear probe on `clip_emb` that predicts the weak `has_person` label, then save a checkpoint that records which table version it was trained on.
+PyTorch reads the tagged version of `night_peds` directly from the table. We train a linear probe on `clip_emb` that predicts the weak `has_vehicle` label (is there a vehicle in the scene?), then save a checkpoint that records which table version it was trained on.
 """
 )
 
@@ -884,7 +907,7 @@ loader = DataLoader(
     LanceDataset(
         ds,
         batch_size=64,
-        columns=["clip_emb", "has_person"],
+        columns=["clip_emb", "has_vehicle"],
         sampler=ShardedBatchSampler(rank=0, world_size=1, randomize=True, seed=0),   # shuffles batch order
     ),
     batch_size=None,   # LanceDataset already yields batches of 64
@@ -908,7 +931,7 @@ for epoch in range(15):
     loader.dataset.sampler.set_epoch(epoch)
     for batch in loader:
         logits = probe(batch["clip_emb"].float()).squeeze(1)
-        loss = loss_fn(logits, batch["has_person"].float())
+        loss = loss_fn(logits, batch["has_vehicle"].float())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -921,7 +944,7 @@ code(
     """
 def fingerprint(dataset) -> str:
     \"\"\"Hash of the exact training rows: ids, embeddings and targets, in id order.\"\"\"
-    t = dataset.to_table(columns=["id", "clip_emb", "has_person"]).sort_by("id")
+    t = dataset.to_table(columns=["id", "clip_emb", "has_vehicle"]).sort_by("id")
     h = hashlib.sha256()
     for name in t.column_names:
         h.update(np.ascontiguousarray(t[name].combine_chunks().flatten() if name == "clip_emb" else t[name].to_numpy()).tobytes())
@@ -929,18 +952,20 @@ def fingerprint(dataset) -> str:
 
 
 def evaluate(model, dataset) -> float:
-    t = dataset.to_table(columns=["clip_emb", "has_person"])
+    t = dataset.to_table(columns=["clip_emb", "has_vehicle"])
     x = torch.tensor(np.stack(t["clip_emb"].to_numpy(zero_copy_only=False)))
-    y = torch.tensor(t["has_person"].to_numpy(zero_copy_only=False), dtype=torch.float32)
+    y = torch.tensor(t["has_vehicle"].to_numpy(zero_copy_only=False), dtype=torch.float32)
     with torch.no_grad():
         return loss_fn(model(x).squeeze(1), y).item()
 
 
-# Held-out check on the labeled rows of the source table, which the slice excluded.
-holdout = tbl.search().where("label IS NOT NULL AND (in_night_peds IS NOT TRUE)").select(["clip_emb", "label"]).limit(10_000).to_pandas()
+# Held-out check: every image outside the slice, scored with the same caption rule as the target.
+holdout = tbl.search().where("in_night_peds IS NOT TRUE").select(["clip_emb", "captions"]).limit(10_000).to_pandas()
+holdout_y = np.array([re.search(VEHICLE_WORDS, " ".join(c).lower()) is not None for c in holdout["captions"]])
 with torch.no_grad():
     pred = probe(torch.tensor(np.stack(holdout["clip_emb"]))).squeeze(1) > 0
-holdout_acc = (pred.numpy() == (holdout["label"] == "person").to_numpy()).mean()
+holdout_acc = (pred.numpy() == holdout_y).mean()
+always_no_acc = (~holdout_y).mean()      # accuracy of always answering "no vehicle"
 
 checkpoint = {
     "state_dict": probe.state_dict(),
@@ -973,7 +998,7 @@ pd.DataFrame([{
     "version": checkpoint["data"]["version"],
     "rows": checkpoint["data"]["rows"],
     "data fingerprint": checkpoint["data"]["fingerprint"][:16],
-    "held-out accuracy": f"{holdout_acc:.0%} on {len(holdout)} labeled rows",
+    "held-out accuracy": f"{holdout_acc:.0%} on {len(holdout):,} other images ({always_no_acc:.0%} if it always said no)",
 }])
 """
 )
@@ -999,12 +1024,12 @@ code(
     """
 new_rows = [dict(row, in_night_peds=False) for row in make_rows(held_back.slice(8))]
 tbl.add(new_rows)                                                    # clip_emb computed on insert
-for column in ["brightness", "dup_of", "quality"]:
+for column in ["brightness", "people_score", "dup_of", "quality"]:
     backfill(column)                                                 # only rows where the column is null
 
 rerun = (
-    tbl.search(query_type="hybrid").vector("low-light street scene").text("pedestrian")
-    .where("label IS NULL").limit(500).to_pandas()
+    tbl.search(query_type="hybrid").vector("pedestrians crossing a dark street at night").text("pedestrian")
+    .where("label IS NULL AND brightness < 0.35 AND people_score > 0").limit(100).to_pandas()
 )
 new_hits = rerun[rerun["id"].isin(held_back["id"].to_pylist())]["id"].tolist()
 if new_hits:
